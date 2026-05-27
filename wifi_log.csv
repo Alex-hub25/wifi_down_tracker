@@ -9,3 +9,9 @@ timestamp,event,duration_down_seconds,duration_down_human,notes
 2026-05-27 12:05:08,WIFI_RESTORED,10.0,10s,
 2026-05-27 12:43:54,TRACKER_STOPPED,,,
 2026-05-27 12:44:09,TRACKER_STARTED,,,GUI monitor started — pinging 8.8.8.8
+2026-05-27 13:05:33,TRACKER_STOPPED,,,
+2026-05-27 13:05:40,TRACKER_STARTED,,,GUI monitor started — pinging 8.8.8.8
+2026-05-27 13:07:53,TRACKER_STOPPED,,,
+2026-05-27 13:07:55,TRACKER_STARTED,,,GUI monitor started — pinging 8.8.8.8
+2026-05-27 13:08:05,TRACKER_STARTED,,,GUI monitor started — pinging 8.8.8.8
+2026-05-27 13:08:18,TRACKER_STARTED,,,GUI monitor started — pinging 8.8.8.8

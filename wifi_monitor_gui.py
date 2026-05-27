@@ -11,6 +11,7 @@ Logs are shared with wifi_tracker.py via wifi_log.csv.
 
 import csv
 import os
+import re
 import subprocess
 import threading
 import time
@@ -40,6 +41,9 @@ ACCENT     = "#818cf8"
 ROW_EVEN   = "#252537"
 ROW_ODD    = "#2a2a3d"
 # ──────────────────────────────────────────────────────────────────────────────
+
+DEVICE_CACHE_TTL = 600  # seconds
+_HOSTNAME_CACHE: dict[str, tuple[str, float]] = {}
 
 
 def is_connected() -> bool:
@@ -138,6 +142,102 @@ def compute_avg_downtime() -> tuple[float, float, float]:
     return avg_day, avg_week, avg_month
 
 
+def get_connected_devices() -> list[tuple[str, str, str, str, str]]:
+    """Return unique (ip, mac, hostname, device_type, arp_kind) rows from ARP."""
+    try:
+        output = subprocess.check_output(
+            ["arp", "-a"],
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    # Example row: 192.168.1.10       00-11-22-33-44-55     dynamic
+    pattern = re.compile(
+        r"^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+([0-9a-fA-F-]{17})\s+(dynamic|static)\s*$",
+        re.IGNORECASE,
+    )
+
+    devices: list[tuple[str, str, str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for line in output.splitlines():
+        m = pattern.match(line)
+        if not m:
+            continue
+
+        ip, mac, kind = m.groups()
+        mac = mac.lower()
+        if mac in ("ff-ff-ff-ff-ff-ff", "00-00-00-00-00-00"):
+            continue
+
+        key = (ip, mac)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        hostname = _resolve_hostname(ip)
+        devices.append((
+            ip,
+            mac,
+            hostname,
+            _guess_device_type(hostname),
+            kind.lower(),
+        ))
+
+    devices.sort(key=lambda x: tuple(int(p) for p in x[0].split(".")))
+    return devices
+
+
+def _resolve_hostname(ip: str) -> str:
+    now = time.time()
+    cached = _HOSTNAME_CACHE.get(ip)
+    if cached and (now - cached[1]) <= DEVICE_CACHE_TTL:
+        return cached[0]
+
+    hostname = "Unknown"
+    try:
+        output = subprocess.check_output(
+            ["ping", "-a", "-n", "1", "-w", "300", ip],
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+        )
+        match = re.search(r"Pinging\s+([^\s\[]+)\s+\[", output, re.IGNORECASE)
+        if match:
+            hostname = match.group(1)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    _HOSTNAME_CACHE[ip] = (hostname, now)
+    return hostname
+
+
+def _guess_device_type(hostname: str) -> str:
+    n = hostname.lower()
+    if n == "unknown":
+        return "Unknown"
+
+    if any(k in n for k in ("router", "gateway", "tplink", "netgear", "asus", "linksys", "fritz", "modem")):
+        return "Router"
+    if any(k in n for k in ("iphone", "android", "pixel", "galaxy", "oneplus", "phone", "mobile")):
+        return "Phone"
+    if any(k in n for k in ("ipad", "tablet", "kindle")):
+        return "Tablet"
+    if any(k in n for k in ("tv", "roku", "chromecast", "firetv", "appletv")):
+        return "TV/Streamer"
+    if any(k in n for k in ("xbox", "playstation", "ps5", "ps4", "nintendo", "switch")):
+        return "Game Console"
+    if any(k in n for k in ("printer", "epson", "canon", "brother", "hp-print")):
+        return "Printer"
+    if any(k in n for k in ("cam", "camera", "ring", "nest", "bulb", "plug", "iot", "echo")):
+        return "Smart Home"
+    if any(k in n for k in ("laptop", "desktop", "pc", "macbook", "thinkpad", "surface", "dell", "lenovo", "imac")):
+        return "Computer"
+    return "Unknown"
+
+
 # ── Monitor thread state ───────────────────────────────────────────────────────
 class MonitorState:
     def __init__(self):
@@ -208,8 +308,8 @@ class App(tk.Tk):
         self.title("Wi-Fi Monitor")
         self.configure(bg=BG)
         self.resizable(True, True)
-        self.minsize(640, 480)
-        self.geometry("780x560")
+        self.minsize(760, 620)
+        self.geometry("900x720")
 
         # Keep window on top option
         self._always_on_top = tk.BooleanVar(value=False)
@@ -285,6 +385,52 @@ class App(tk.Tk):
         self._avg_day_lbl   = _avg_col(avg_cols_frame, "Per Day")
         self._avg_week_lbl  = _avg_col(avg_cols_frame, "Per Week")
         self._avg_month_lbl = _avg_col(avg_cols_frame, "Per Month")
+
+        # ── Devices card ──
+        devices_card = tk.Frame(self, bg=PANEL, bd=0, relief="flat")
+        devices_card.pack(fill="x", padx=16, pady=(0, 8))
+
+        devices_header = tk.Frame(devices_card, bg=PANEL)
+        devices_header.pack(fill="x", padx=12, pady=(8, 4))
+
+        tk.Label(devices_header, text="Devices On Wi-Fi",
+                 font=("Segoe UI", 9, "bold"),
+                 bg=PANEL, fg=ACCENT).pack(side="left")
+
+        self._devices_count_lbl = tk.Label(
+            devices_header,
+            text="0 found",
+            font=("Segoe UI", 8),
+            bg=PANEL,
+            fg=SUBTEXT,
+        )
+        self._devices_count_lbl.pack(side="right")
+
+        devices_cols = ("ip", "mac", "hostname", "device_type", "arp_kind")
+        self._devices_tree = ttk.Treeview(
+            devices_card,
+            columns=devices_cols,
+            show="headings",
+            height=6,
+        )
+
+        self._devices_tree.heading("ip", text="IP Address")
+        self._devices_tree.heading("mac", text="MAC Address")
+        self._devices_tree.heading("hostname", text="Hostname")
+        self._devices_tree.heading("device_type", text="Device Type")
+        self._devices_tree.heading("arp_kind", text="ARP Type")
+        self._devices_tree.column("ip", width=150, anchor="w")
+        self._devices_tree.column("mac", width=200, anchor="w")
+        self._devices_tree.column("hostname", width=180, anchor="w")
+        self._devices_tree.column("device_type", width=130, anchor="w")
+        self._devices_tree.column("arp_kind", width=100, anchor="w")
+
+        dev_vsb = ttk.Scrollbar(devices_card, orient="vertical",
+                                command=self._devices_tree.yview)
+        self._devices_tree.configure(yscrollcommand=dev_vsb.set)
+
+        self._devices_tree.pack(side="left", fill="x", expand=True, padx=(12, 0), pady=(0, 10))
+        dev_vsb.pack(side="right", fill="y", padx=(0, 12), pady=(0, 10))
 
         # ── Separator ──
         sep = tk.Frame(self, bg=ACCENT, height=1)
@@ -362,6 +508,7 @@ class App(tk.Tk):
         self._update_status()
         self._update_table()
         self._update_averages()
+        self._update_devices()
         self._footer_lbl.config(
             text=f"Last checked: {datetime.now().strftime('%H:%M:%S')}  |  "
                  f"Checking every {CHECK_INTERVAL}s"
@@ -377,6 +524,22 @@ class App(tk.Tk):
             text=seconds_to_human(avg_week)  if avg_week  else na)
         self._avg_month_lbl.config(
             text=seconds_to_human(avg_month) if avg_month else na)
+
+    def _update_devices(self):
+        devices = get_connected_devices()
+        existing = len(self._devices_tree.get_children())
+
+        if existing == len(devices):
+            prev = [self._devices_tree.item(iid, "values") for iid in self._devices_tree.get_children()]
+            if prev == [tuple(d) for d in devices]:
+                self._devices_count_lbl.config(text=f"{len(devices)} found")
+                return
+
+        self._devices_tree.delete(*self._devices_tree.get_children())
+        for device in devices:
+            self._devices_tree.insert("", "end", values=device)
+
+        self._devices_count_lbl.config(text=f"{len(devices)} found")
 
     def _update_status(self):
         with state.lock:
